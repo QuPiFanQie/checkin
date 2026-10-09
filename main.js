@@ -1,39 +1,87 @@
+const safeText = (value, fallback = 'Unknown error') => {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  return (text || fallback).slice(0, 200)
+}
+
+const isAlreadyCheckedIn = (action) => {
+  if (!action?.code) return false
+  return /please\s+try\s+tomorrow|already\s+checked|checked\s+in/i.test(
+    safeText(action?.message, '')
+  )
+}
+
 const glados = async () => {
   const notice = []
-  if (!process.env.GLADOS) return
+  let failed = false
+  let hasCookie = false
+
+  if (!process.env.GLADOS) {
+    return {
+      notice: ['Checkin Error', 'GLADOS secret is missing'],
+      failed: true,
+    }
+  }
+
   for (const cookie of String(process.env.GLADOS).split('\n')) {
     if (!cookie) continue
+    hasCookie = true
     try {
       const common = {
         'cookie': cookie,
         'referer': 'https://glados.cloud/console/checkin',
         'user-agent': 'Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.0)',
       }
-      const action = await fetch('https://glados.cloud/api/user/checkin', {
+      const actionResponse = await fetch('https://glados.cloud/api/user/checkin', {
         method: 'POST',
         headers: { ...common, 'content-type': 'application/json' },
         body: '{"token":"glados.cloud"}',
-      }).then((r) => r.json())
-      if (action?.code) throw new Error(action?.message)
-      const status = await fetch('https://glados.cloud/api/user/status', {
+      })
+      if (!actionResponse.ok) {
+        throw new Error(`Checkin HTTP ${actionResponse.status}`)
+      }
+      const action = await actionResponse.json()
+      const alreadyCheckedIn = isAlreadyCheckedIn(action)
+      if (action?.code && !alreadyCheckedIn) {
+        throw new Error(safeText(action?.message, `Checkin API code ${action.code}`))
+      }
+
+      const statusResponse = await fetch('https://glados.cloud/api/user/status', {
         method: 'GET',
         headers: { ...common },
-      }).then((r) => r.json())
-      if (status?.code) throw new Error(status?.message)
+      })
+      if (!statusResponse.ok) {
+        throw new Error(`Status HTTP ${statusResponse.status}`)
+      }
+      const status = await statusResponse.json()
+      if (status?.code) {
+        throw new Error(safeText(status?.message, `Status API code ${status.code}`))
+      }
+
       notice.push(
-        'Checkin OK',
-        `${action?.message}`,
+        alreadyCheckedIn ? 'Already checked in' : 'Checkin OK',
+        alreadyCheckedIn
+          ? 'The account was already checked in today'
+          : safeText(action?.message, 'Checkin completed'),
         `Left Days ${Number(status?.data?.leftDays)}`
       )
     } catch (error) {
+      failed = true
       notice.push(
         'Checkin Error',
-        `${error}`,
+        safeText(error?.message),
         `<${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}>`
       )
     }
   }
-  return notice
+
+  if (!hasCookie) {
+    return {
+      notice: ['Checkin Error', 'GLADOS secret is empty'],
+      failed: true,
+    }
+  }
+
+  return { notice, failed }
 }
 
 const notify = async (notice) => {
@@ -101,7 +149,16 @@ const notify = async (notice) => {
 }
 
 const main = async () => {
-  await notify(await glados())
+  const result = await glados()
+  for (const line of result.notice) {
+    console.log(line)
+  }
+  await notify(result.notice)
+  if (result.failed) process.exitCode = 1
 }
 
-main()
+main().catch((error) => {
+  console.error('Checkin Error')
+  console.error(safeText(error?.message))
+  process.exitCode = 1
+})
